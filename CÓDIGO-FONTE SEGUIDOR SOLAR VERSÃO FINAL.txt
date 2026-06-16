@@ -1,0 +1,606 @@
+// =========================================================================
+//   PROJETO SEGUIDOR SOLAR ESP32 — V7.3 (DASHBOARD COM INTERATIVIDADE)
+//   Modo: ACCESS POINT — Conecte no Wi-Fi "Seguidor_Solar_ESP32" → 192.168.4.1
+//   Dashboard integrado com simulador de inclinação e gráfico único interativo
+// =========================================================================
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// -------------------------------------------------------------------------
+//  CONFIGURAÇÃO DO ACCESS POINT & PINOS
+// -------------------------------------------------------------------------
+const char*     AP_SSID = "Seguidor_Solar_ESP32";
+const char*     AP_PASS = "12345678";
+const IPAddress AP_IP(192, 168, 4, 1);
+
+#define PIN_LDR_ESQ 32
+#define PIN_LDR_DIR 33
+#define PIN_SERVO   26
+
+// -------------------------------------------------------------------------
+//  OLED SSD1306 (128x64 I2C)
+// -------------------------------------------------------------------------
+#define OLED_W    128
+#define OLED_H     64
+#define OLED_RST   -1
+#define OLED_ADDR 0x3C
+Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, OLED_RST);
+
+// -------------------------------------------------------------------------
+//  PARÂMETROS DE CONTROLE E SIMULAÇÃO ELÉTRICA
+// -------------------------------------------------------------------------
+#define ANG_MIN   65
+#define ANG_MAX  115
+#define TOLERAN   80
+#define V_BASE   6.0f   // Tensão base (V)
+#define I_PICO   2.0f   // Corrente de pico (A) a 90°
+
+#define T_LOOP  300UL   // ms — Período de controle/atualização dos dados
+#define T_OLED 3000UL   // ms — Período de alternância de tela OLED
+
+// -------------------------------------------------------------------------
+//  ESTADO GLOBAL DO SISTEMA (Sincronizado)
+// -------------------------------------------------------------------------
+Servo     servo;
+WebServer server(80);
+
+int   ldrEsq    = 0;
+int   ldrDir    = 0;
+int   difLdr    = 0;
+float posServo  = 90.0f;
+int   angulo    = 90;
+
+float tensao    = V_BASE;
+float corrente  = 0.0f;
+float potencia  = 0.0f;
+float energiaWh = 0.0f;
+
+const char* statusTrk = "Alinhado";
+
+unsigned long tLoop = 0;
+unsigned long tOled = 0;
+uint8_t       tela  = 0;
+
+// =========================================================================
+//  HTML / CSS / JS — DASHBOARD (100% OFFLINE COM SVG NATIVO)
+// =========================================================================
+const char PAGE_DASHBOARD[] PROGMEM = R"RAWHTML(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seguidor Solar — Dashboard</title>
+<style>
+  :root {
+    --verde: #39d353; --amarelo: #e3b341; --vermelho: #f85149; --azul: #58a6ff;
+    --fundo: #010409; --card: #0d1117; --borda: #21262d; --texto: #c9d1d9;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--fundo); color: var(--texto); font-family: 'Courier New', monospace;
+    min-height: 100vh; padding: 16px;
+  }
+  h1 { text-align: center; color: var(--azul); font-size: 1.3rem; letter-spacing: 3px; margin-bottom: 4px; text-transform: uppercase; }
+  .subtitle { text-align: center; font-size: .68rem; color: #484f58; margin-bottom: 20px; letter-spacing: 2px; }
+  
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 14px; }
+  @media(min-width: 768px) { .grid { grid-template-columns: repeat(5, 1fr); } }
+  
+  .card { background: var(--card); border: 1px solid var(--borda); border-radius: 8px; padding: 14px; text-align: center; position: relative; overflow: hidden; }
+  .card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; }
+  .card.ok::before { background: var(--verde); }
+  .card.info::before { background: var(--azul); }
+  .card.warn::before { background: var(--amarelo); }
+  .card .label { font-size: .65rem; letter-spacing: 2px; color: #8b949e; text-transform: uppercase; margin-bottom: 8px; }
+  .card .value { font-size: 1.7rem; font-weight: bold; }
+  .card.ok .value { color: var(--verde); }
+  .card.info .value { color: var(--azul); }
+  .card.warn .value { color: var(--amarelo); }
+  
+  .section { background: var(--card); border: 1px solid var(--borda); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+  .section h2 { font-size: .7rem; letter-spacing: 2px; color: #8b949e; text-transform: uppercase; margin-bottom: 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 10px; }
+  
+  .badge { display: inline-block; padding: 3px 12px; border-radius: 12px; font-size: .72rem; font-weight: bold; letter-spacing: 1px; }
+  .badge.info { background: #0d419d; color: var(--azul); border: 1px solid var(--azul); }
+  
+  .main-layout { display: grid; grid-template-columns: 1fr; gap: 12px; margin-bottom: 12px; }
+  @media(min-width: 768px) { .main-layout { grid-template-columns: 2fr 1fr; } }
+  
+  /* Container Gráfico */
+  .chart-container { background: var(--card); border: 1px solid var(--borda); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; position: relative; }
+  .chart-title { font-size: .65rem; color: #8b949e; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 10px; }
+  .gp { position: relative; height: 180px; width: 100%; }
+  .svg-chart { width: 100%; height: 100%; background: #070a0e; border-radius: 4px; border: 1px solid var(--borda); cursor: crosshair; }
+  
+  /* Tooltip flutuante */
+  .tooltip {
+    position: absolute; background: rgba(13, 17, 23, 0.95); border: 1px solid var(--borda);
+    border-radius: 4px; padding: 8px; font-size: 0.7rem; pointer-events: none;
+    display: none; z-index: 10; box-shadow: 0 4px 12px rgba(0,0,0,0.5); line-height: 1.4;
+  }
+  
+  /* Seletores de Variáveis */
+  .selectors { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 10px; font-size: 0.72rem; justify-content: flex-start; }
+  .sel-item { display: flex; align-items: center; cursor: pointer; user-select: none; }
+  .sel-item input { margin-right: 5px; cursor: pointer; }
+  
+  /* Simulador do Painel */
+  .sim-container { background: var(--card); border: 1px solid var(--borda); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; align-items: center; }
+  .sim-view { position: relative; width: 100%; height: 150px; background: #070a0e; border-radius: 4px; border: 1px solid var(--borda); overflow: hidden; margin-top: auto; margin-bottom: auto; }
+  .sim-ground { position: absolute; bottom: 15px; left: 10%; width: 80%; height: 3px; background: #21262d; }
+  .sim-post { position: absolute; bottom: 18px; left: calc(50% - 4px); width: 8px; height: 55px; background: #8b949e; border-radius: 2px; }
+  .sim-panel { position: absolute; bottom: 73px; left: calc(50% - 60px); width: 120px; height: 8px; background: #1f6feb; border: 1px solid var(--azul); border-radius: 4px; transform-origin: center center; transition: transform 0.4s ease-out; }
+  .sim-panel::after { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: repeating-linear-gradient(90deg, transparent, transparent 18px, rgba(255,255,255,0.2) 18px, rgba(255,255,255,0.2) 20px); }
+  .sim-angle { position: absolute; top: 10px; right: 10px; font-size: 0.75rem; color: var(--azul); font-weight: bold; }
+
+  .table-container { max-height: 200px; overflow-y: auto; border: 1px solid var(--borda); border-radius: 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.75rem; text-align: center; }
+  th { background: #161b22; color: #8b949e; padding: 8px; font-weight: bold; text-transform: uppercase; font-size: 0.65rem; }
+  td { padding: 6px; border-bottom: 1px solid var(--borda); color: var(--texto); }
+  tr:hover td { background: #1c2128; }
+
+  .btn { padding: 6px 14px; border: 1px solid var(--borda); border-radius: 6px; cursor: pointer; font-family: inherit; font-size: .72rem; font-weight: bold; background: #161b22; color: var(--texto); transition: 0.2s; text-decoration: none; }
+  .btn:hover { background: var(--borda); }
+
+  footer { text-align: center; font-size: .66rem; color: #484f58; margin-top: 18px; }
+</style>
+</head>
+<body>
+<h1>[ SEGUIDOR SOLAR ESP32 ]</h1>
+<p class="subtitle">PAINEL DE MONITORAMENTO E PRODUÇÃO ELÉTRICA</p>
+
+<!-- CARDS EM GRID -->
+<div class="grid">
+  <div class="card info">
+    <div class="label">Ângulo Servo</div>
+    <div class="value" id="mAng">—<small style="font-size:.7rem">°</small></div>
+  </div>
+  <div class="card ok">
+    <div class="label">Corrente</div>
+    <div class="value" id="mI">—<small style="font-size:.7rem"> A</small></div>
+  </div>
+  <div class="card ok">
+    <div class="label">Tensão</div>
+    <div class="value" id="mV">—<small style="font-size:.7rem"> V</small></div>
+  </div>
+  <div class="card ok">
+    <div class="label">Potência</div>
+    <div class="value" id="mP">—<small style="font-size:.7rem"> W</small></div>
+  </div>
+  <div class="card warn">
+    <div class="label">Energia Acum.</div>
+    <div class="value" id="mEwh">—<small style="font-size:.7rem"> Wh</small></div>
+  </div>
+</div>
+
+<!-- STATUS E LDRS -->
+<div class="section">
+  <h2>// Diagnóstico de Rastreamento</h2>
+  <div class="row">
+    <span>Status Rastreamento:</span>
+    <span class="badge info" id="tStat">—</span>
+    <span>LDR Esq: <strong id="tLE">—</strong></span>
+    <span>LDR Dir: <strong id="tLD">—</strong></span>
+    <span>Diferença: <strong id="tDif">—</strong></span>
+    <span id="stConn" style="margin-left:auto; font-size:0.7rem; color:var(--verde)">● Conectado ao ESP32 AP</span>
+  </div>
+</div>
+
+<!-- GRÁFICO E SIMULADOR VISUAL -->
+<div class="main-layout">
+  
+  <!-- Painel Esquerdo: Gráfico de Linha Unificado -->
+  <div class="chart-container">
+    <div class="chart-title">Variáveis Elétricas e Geração (Tempo Real)</div>
+    
+    <div class="selectors">
+      <label class="sel-item" style="color: var(--vermelho)">
+        <input type="checkbox" id="chkPow" checked onchange="drawChart()"> Potência (W)
+      </label>
+      <label class="sel-item" style="color: var(--amarelo)">
+        <input type="checkbox" id="chkTens" checked onchange="drawChart()"> Tensão (V)
+      </label>
+      <label class="sel-item" style="color: var(--verde)">
+        <input type="checkbox" id="chkCurr" checked onchange="drawChart()"> Corrente (A)
+      </label>
+      <label class="sel-item" style="color: var(--azul)">
+        <input type="checkbox" id="chkEner" checked onchange="drawChart()"> Geração (Wh)
+      </label>
+    </div>
+
+    <div class="gp">
+      <svg class="svg-chart" id="svgCanvas" viewBox="0 0 300 150" onmousemove="handleMouseMove(event)" onmouseleave="handleMouseLeave()">
+        <!-- Linhas de Grade de Fundo -->
+        <line x1="0" y1="37.5" x2="300" y2="37.5" stroke="#161b22" stroke-dasharray="2" />
+        <line x1="0" y1="75" x2="300" y2="75" stroke="#21262d" />
+        <line x1="0" y1="112.5" x2="300" y2="112.5" stroke="#161b22" stroke-dasharray="2" />
+        
+        <!-- Orientações do Eixo (Abcissa/Ordenada) -->
+        <text x="5" y="15" fill="#484f58" font-size="7" font-weight="bold">Valor ↑</text>
+        <text x="250" y="145" fill="#484f58" font-size="7" font-weight="bold">Tempo →</text>
+        
+        <!-- Marcadores do Eixo Y -->
+        <text x="5" y="34" fill="#21262d" font-size="6">75%</text>
+        <text x="5" y="72" fill="#21262d" font-size="6">50%</text>
+        <text x="5" y="110" fill="#21262d" font-size="6">25%</text>
+
+        <!-- Linha Vertical do Tooltip -->
+        <line id="trackLine" x1="0" y1="0" x2="0" y2="150" stroke="#8b949e" stroke-dasharray="3" opacity="0" pointer-events="none"></line>
+
+        <!-- Caminhos das Linhas (Desenho Dinâmico) -->
+        <path id="pathPow" fill="none" stroke="var(--vermelho)" stroke-width="2" d=""></path>
+        <path id="pathTens" fill="none" stroke="var(--amarelo)" stroke-width="1.5" d=""></path>
+        <path id="pathCurr" fill="none" stroke="var(--verde)" stroke-width="2" d=""></path>
+        <path id="pathEner" fill="none" stroke="var(--azul)" stroke-width="1.5" d=""></path>
+      </svg>
+      <div class="tooltip" id="tooltip"></div>
+    </div>
+  </div>
+
+  <!-- Painel Direito: Simulador de Inclinação do Servomotor -->
+  <div class="sim-container">
+    <div class="chart-title">Simulação Física da Inclinação</div>
+    <div class="sim-view">
+      <div class="sim-angle" id="simAng">0°</div>
+      <div class="sim-ground"></div>
+      <div class="sim-post"></div>
+      <div class="sim-panel" id="simPanel"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- REGISTRO HISTÓRICO -->
+<div class="section">
+  <div class="row" style="justify-content:space-between; margin-bottom:12px">
+    <h2>// Registro de Dados</h2>
+    <button class="btn" onclick="exportCSV()">Exportar CSV</button>
+  </div>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Hora</th><th>LDR Esq</th><th>LDR Dir</th><th>Ângulo (°)</th>
+          <th>Corrente (A)</th><th>Tensão (V)</th><th>Potência (W)</th><th>Energia (Wh)</th>
+        </tr>
+      </thead>
+      <tbody id="tb"></tbody>
+    </table>
+  </div>
+</div>
+
+<footer>AP: Seguidor_Solar_ESP32 &nbsp;|&nbsp; IP: 192.168.4.1</footer>
+
+<script>
+  const $ = id => document.getElementById(id);
+  const T = () => new Date().toLocaleTimeString('pt-BR', {hour12:false});
+  
+  let histCurr = [];
+  let histPow  = [];
+  let histTens = [];
+  let histEner = [];
+  let historicoCompleto = [];
+
+  // Função interna do SVG para mapear e traçar pontos dinâmicos auto-ajustados
+  function buildPath(data, maxVal, minVal) {
+    if (data.length === 0) return "";
+    const w = 300, h = 150;
+    const points = data.map((val, index) => {
+      const x = (index / (data.length - 1 || 1)) * w;
+      const range = (maxVal - minVal) || 1;
+      const norm = (val - minVal) / range;
+      const y = h - (norm * (h - 20)) - 10; // Margem de segurança de 10px
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    return 'M ' + points.join(' L ');
+  }
+
+  function drawChart() {
+    // Escalonamento dinâmico ou fixo para as variáveis no mesmo plano cartesiano
+    const maxEnergy = Math.max(...histEner, 0.001);
+
+    $('pathPow').setAttribute('d', $('chkPow').checked ? buildPath(histPow, 15.0, 0) : "");
+    $('pathTens').setAttribute('d', $('chkTens').checked ? buildPath(histTens, 12.0, 0) : "");
+    $('pathCurr').setAttribute('d', $('chkCurr').checked ? buildPath(histCurr, 2.5, 0) : "");
+    $('pathEner').setAttribute('d', $('chkEner').checked ? buildPath(histEner, maxEnergy, 0) : "");
+  }
+
+  function addTableRow(time, d) {
+    const row = { ts: time, le: d.ldrEsq, ld: d.ldrDir, ang: d.angulo, i: d.corrente, v: d.tensao, p: d.potencia, e: d.energiaWh };
+    historicoCompleto.push(row);
+    if (historicoCompleto.length > 30) historicoCompleto.shift();
+
+    const tbody = $('tb');
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${row.ts}</td><td>${row.le}</td><td>${row.ld}</td><td>${row.ang}°</td><td>${row.i.toFixed(3)}</td><td>${row.v.toFixed(2)}</td><td>${row.p.toFixed(3)}</td><td>${row.e.toFixed(5)}</td>`;
+    tbody.insertBefore(tr, tbody.firstChild);
+    if (tbody.rows.length > 30) tbody.deleteRow(tbody.rows.length - 1);
+  }
+
+  // Lógica de Tooltip Interativa baseada na aproximação do cursor do mouse
+  function handleMouseMove(e) {
+    const svg = $('svgCanvas');
+    const rect = svg.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const svgW = rect.width;
+
+    const dataLength = histCurr.length;
+    if (dataLength === 0) return;
+
+    // Determina o índice de dados mais próximo com base na posição X do mouse
+    let idx = Math.round((mouseX / svgW) * (dataLength - 1));
+    idx = Math.max(0, Math.min(dataLength - 1, idx));
+
+    const xPosSVG = (idx / (dataLength - 1 || 1)) * 300;
+
+    // Atualiza linha guia vertical
+    $('trackLine').setAttribute('x1', xPosSVG);
+    $('trackLine').setAttribute('x2', xPosSVG);
+    $('trackLine').setAttribute('opacity', '0.6');
+
+    // Posiciona e popula o balão de Tooltip flutuante
+    const tooltip = $('tooltip');
+    tooltip.style.display = 'block';
+
+    const gpRect = svg.parentElement.getBoundingClientRect();
+    let xTooltip = e.clientX - gpRect.left + 15;
+    let yTooltip = e.clientY - gpRect.top + 15;
+
+    // Impede que o tooltip ultrapasse a borda direita da visualização
+    if (xTooltip > gpRect.width - 130) {
+      xTooltip = e.clientX - gpRect.left - 140;
+    }
+
+    tooltip.style.left = xTooltip + 'px';
+    tooltip.style.top = yTooltip + 'px';
+
+    const row = historicoCompleto[idx];
+    if (row) {
+      tooltip.innerHTML = `
+        <div style="font-weight:bold;border-bottom:1px solid var(--borda);margin-bottom:5px;padding-bottom:2px;color:#8b949e">${row.ts}</div>
+        <div style="color:var(--vermelho);display:${$('chkPow').checked ? 'block':'none'}">Pot: ${row.p.toFixed(3)} W</div>
+        <div style="color:var(--amarelo);display:${$('chkTens').checked ? 'block':'none'}">Ten: ${row.v.toFixed(2)} V</div>
+        <div style="color:var(--verde);display:${$('chkCurr').checked ? 'block':'none'}">Cor: ${row.i.toFixed(3)} A</div>
+        <div style="color:var(--azul);display:${$('chkEner').checked ? 'block':'none'}">Ene: ${row.e.toFixed(5)} Wh</div>
+      `;
+    }
+  }
+
+  function handleMouseLeave() {
+    $('trackLine').setAttribute('opacity', '0');
+    $('tooltip').style.display = 'none';
+  }
+
+  async function poll() {
+    const time = T();
+    try {
+      const res = await fetch('/data', { cache: 'no-store' });
+      const d = await res.json();
+      
+      // Atualização dos cartões superiores
+      $('mAng').innerHTML = `${d.angulo}<small style='font-size:.7rem'>°</small>`;
+      $('mI').innerHTML   = `${d.corrente.toFixed(3)}<small style='font-size:.7rem'> A</small>`;
+      $('mV').innerHTML   = `${d.tensao.toFixed(2)}<small style='font-size:.7rem'> V</small>`;
+      $('mP').innerHTML   = `${d.potencia.toFixed(3)}<small style='font-size:.7rem'> W</small>`;
+      $('mEwh').innerHTML = `${d.energiaWh.toFixed(5)}<small style='font-size:.7rem'> Wh</small>`;
+      
+      // Diagnóstico de rastreamento
+      $('tStat').innerText = d.status;
+      $('tLE').innerText   = d.ldrEsq;
+      $('tLD').innerText   = d.ldrDir;
+      $('tDif').innerText  = d.diferenca;
+      
+      $('stConn').style.color = 'var(--verde)';
+      $('stConn').innerText = '● Conectado ao ESP32 AP';
+
+      // Atualização do Simulador de Inclinação Visual
+      const visualAngle = d.angulo - 90; 
+      $('simPanel').style.transform = `rotate(${visualAngle}deg)`;
+      $('simAng').innerText = `${d.angulo}°`;
+
+      // Armazenamento do histórico de dados local
+      histCurr.push(d.corrente);
+      histPow.push(d.potencia);
+      histTens.push(d.tensao);
+      histEner.push(d.energiaWh);
+
+      if (histCurr.length > 30) {
+        histCurr.shift();
+        histPow.shift();
+        histTens.shift();
+        histEner.shift();
+      }
+
+      // Redesenha as linhas do gráfico unificado
+      drawChart();
+
+      addTableRow(time, d);
+    } catch (e) {
+      $('stConn').style.color = 'var(--vermelho)';
+      $('stConn').innerText = '○ Desconectado / Tentando Reconexão...';
+    }
+  }
+
+  function exportCSV() {
+    if (!historicoCompleto.length) return alert("Nenhum dado registrado.");
+    let csv = "Hora,LDR_Esq,LDR_Dir,Angulo,Corrente(A),Tensao(V),Potencia(W),Energia(Wh)\n";
+    historicoCompleto.forEach(r => {
+      csv += `${r.ts},${r.le},${r.ld},${r.ang},${r.i.toFixed(4)},${r.v.toFixed(2)},${r.p.toFixed(4)},${r.e.toFixed(6)}\n`;
+    });
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: 'historico_solar.csv' });
+    a.click();
+  }
+
+  // Agenda pooling imediato e loops subsequentes
+  poll();
+  setInterval(poll, 1000);
+</script>
+</body>
+</html>
+)RAWHTML";
+
+// =========================================================================
+//  HANDLERS DO SERVIDOR WEB
+// =========================================================================
+void handleRoot() {
+  server.send_P(200, "text/html", PAGE_DASHBOARD);
+}
+
+void handleData() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-store");
+  
+  String json = "{";
+  json += "\"ldrEsq\":"    + String(ldrEsq) + ",";
+  json += "\"ldrDir\":"    + String(ldrDir) + ",";
+  json += "\"diferenca\":" + String(difLdr) + ",";
+  json += "\"angulo\":"    + String(angulo) + ",";
+  json += "\"corrente\":"  + String(corrente, 4) + ",";
+  json += "\"tensao\":"    + String(tensao, 2) + ",";
+  json += "\"potencia\":"  + String(potencia, 4) + ",";
+  json += "\"energiaWh\":" + String(energiaWh, 6) + ",";
+  json += "\"status\":\""  + String(statusTrk) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// =========================================================================
+//  LÓGICA AUXILIAR / SIMULADOR ELÉTRICO
+// =========================================================================
+void simularEletrico(float dtS) {
+  float al   = constrain(1.0f - (abs(angulo - 90) / 25.0f), 0.0f, 1.0f);
+  corrente   = max(0.0f, I_PICO * al + (random(-30, 30) / 1000.0f));
+  tensao     = V_BASE + (al * 0.2f) + (random(-5, 5) / 100.0f);
+  potencia   = tensao * corrente;
+  energiaWh += potencia * (dtS / 3600.0f);
+}
+
+// =========================================================================
+//  EXIBIÇÃO NO DISPLAY OLED (Alternância Otimizada)
+// =========================================================================
+void atualizarOLED() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  switch (tela) {
+    case 0: // Rastreamento LDR
+      display.setCursor(0, 0);  display.println("== RASTREAMENTO LDR ==");
+      display.setCursor(0, 15); display.printf("LDR Esq: %d\n", ldrEsq);
+      display.setCursor(0, 27); display.printf("LDR Dir: %d\n", ldrDir);
+      display.setCursor(0, 39); display.printf("Dif:     %d (Tol:%d)\n", difLdr, TOLERAN);
+      display.setCursor(0, 52); display.printf("Ang:     %d deg\n", angulo);
+      break;
+
+    case 1: // Elétrico Simulado
+      display.setCursor(0, 0);  display.println("== METRICAS DA PLACA =");
+      display.setCursor(0, 15); display.printf("Corr: %.3f A\n", corrente);
+      display.setCursor(0, 27); display.printf("Tens: %.2f V\n", tensao);
+      display.setCursor(0, 39); display.printf("Pot : %.3f W\n", potencia);
+      display.setCursor(0, 52); display.printf("Ener: %.5f Wh\n", energiaWh);
+      break;
+
+    case 2: // Rede / AP Info
+      display.setCursor(0, 0);  display.println("== DADOS DA CONEXAO ==");
+      display.setCursor(0, 15); display.printf("SSID: %s\n", AP_SSID);
+      display.setCursor(0, 27); display.print("IP  : "); display.println(WiFi.softAPIP());
+      display.setCursor(0, 39); display.println("Acesse: 192.168.4.1");
+      display.setCursor(0, 52); display.printf("Clients: %d\n", WiFi.softAPgetStationNum());
+      break;
+  }
+  display.display();
+}
+
+// =========================================================================
+//  SETUP
+// =========================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin();
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("[ERRO] Display OLED nao iniciado!");
+    while (1);
+  }
+  
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Seguidor Solar V7.3");
+  display.println("Iniciando AP...");
+  display.display();
+
+  pinMode(PIN_LDR_ESQ, INPUT);
+  pinMode(PIN_LDR_DIR, INPUT);
+
+  servo.setPeriodHertz(50);
+  servo.attach(PIN_SERVO, 500, 2500);
+  servo.writeMicroseconds(map(angulo, 0, 180, 500, 2500));
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(AP_SSID, AP_PASS);
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+
+  randomSeed(esp_random());
+  tLoop = millis();
+}
+
+// =========================================================================
+//  LOOP DE CONTROLE PRINCIPAL
+// =========================================================================
+void loop() {
+  server.handleClient();
+  unsigned long agora = millis();
+
+  // Ciclo Principal de Controle (300 ms)
+  if (agora - tLoop >= T_LOOP) {
+    float dtS = (agora - tLoop) / 1000.0f;
+    tLoop     = agora;
+
+    ldrEsq = analogRead(PIN_LDR_ESQ);
+    ldrDir = analogRead(PIN_LDR_DIR);
+    difLdr = ldrEsq - ldrDir;
+
+    // Ajuste da posição do servo motor com base nos LDRs usando Operador Ternário
+    posServo += (abs(difLdr) <= TOLERAN) ? 0.0f : ((difLdr > 0) ? -1.0f : 1.0f);
+    posServo = constrain(posServo, ANG_MIN, ANG_MAX);
+    angulo   = (int)posServo;
+    servo.writeMicroseconds(map(angulo, 0, 180, 500, 2500));
+
+    // Determina o status da operação via Operador Ternário
+    statusTrk = (abs(difLdr) <= TOLERAN) ? "Alinhado" : ((difLdr > 0) ? "Mov. Horario" : "Mov. Anti-Horario");
+
+    // Processa a simulação elétrica correspondente
+    simularEletrico(dtS);
+
+    // Sincronização e Envio das Informações pelo Monitor Serial
+    Serial.println("\n=== MONITORAMENTO SEGUIDOR SOLAR ===");
+    Serial.printf("Alinhamento : LDR_Esq: %4d | LDR_Dir: %4d | Diferenca: %4d\n", ldrEsq, ldrDir, difLdr);
+    Serial.printf("Servo Motor : Angulo : %3d deg | Status   : %s\n", angulo, statusTrk);
+    Serial.printf("Eletrico    : %.2f V  | %.3f A   | %.3f W\n", tensao, corrente, potencia);
+    Serial.printf("Acumulado   : %.5f Wh\n", energiaWh);
+    Serial.println("=====================================");
+  }
+
+  // Ciclo de Transição de Telas do OLED (3 segundos)
+  if (agora - tOled >= T_OLED) {
+    tOled = agora;
+    tela  = (tela + 1) % 3;
+    atualizarOLED();
+  }
+}
